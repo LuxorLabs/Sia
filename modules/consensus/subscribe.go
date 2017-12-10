@@ -171,7 +171,7 @@ func (cs *ConsensusSet) managedInitializeSubscribe(subscriber modules.ConsensusS
 		// lock for too long.
 		cs.mu.RLock()
 		err = cs.db.View(func(tx *bolt.Tx) error {
-			for i := 0; i < 100 && exists; i++ {
+			for i := 0; i < 10000 && exists; i++ {
 				select {
 				case <-cancel:
 					return siasync.ErrStopped

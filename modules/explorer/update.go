@@ -102,7 +102,7 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 		// use exception-style error handling to enable more concise update code
 		defer func() {
 			if r := recover(); r != nil {
-				err = fmt.Errorf("%v", r)
+				err = fmt.Errorf("Recover: %v", r)
 			}
 		}()
 
@@ -356,14 +356,17 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 			}
 		}
 
-		e.log.Printf("Explorer update for block: %d", blockheight)
+		if blockheight%100 == 0 {
+			e.log.Printf("Explorer update for block: %d", blockheight)
+		}
+
 		e.persistMu.Lock()
 		e.persist.Height = blockheight
 		e.persist.RecentChange = cc.ID
 		e.persist.Target = cc.ChildTarget
+		err = e.saveSync()
 		e.persistMu.Unlock()
 
-		err = e.saveSync()
 		return err
 	})
 
