@@ -102,7 +102,7 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 		// use exception-style error handling to enable more concise update code
 		defer func() {
 			if r := recover(); r != nil {
-				err = fmt.Errorf("%v", r)
+				err = fmt.Errorf("Recover: %v", r)
 			}
 		}()
 
@@ -111,11 +111,13 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 		blockheight := e.persist.Height
 		e.persistMu.Unlock()
 
+		e.log.Println("Blockheight AT START:", blockheight)
+
 		// Update cumulative stats for reverted blocks.
 		for _, block := range cc.RevertedBlocks {
+			e.log.Printf("Reverting block %s at height: %d", block.ID(), blockheight)
 			bid := block.ID()
 			tbid := types.TransactionID(bid)
-
 			blockheight--
 			dbRemoveBlockID(tx, bid)
 			dbRemoveTransactionID(tx, tbid) // Miner payouts are a transaction
@@ -152,6 +154,7 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 					fcid := txn.FileContractID(uint64(k))
 					dbRemoveFileContractID(tx, fcid, txid)
 					dbRemoveUnlockHash(tx, fc.UnlockHash, txid)
+					dbRemoveFileContract(tx, fcid)
 					for l, sco := range fc.ValidProofOutputs {
 						scoid := fcid.StorageProofOutputID(types.ProofValid, uint64(l))
 						dbRemoveSiacoinOutputID(tx, scoid, txid)
@@ -162,7 +165,6 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 						dbRemoveSiacoinOutputID(tx, scoid, txid)
 						dbRemoveUnlockHash(tx, sco.UnlockHash, txid)
 					}
-					dbRemoveFileContract(tx, fcid)
 				}
 				for _, fcr := range txn.FileContractRevisions {
 					dbRemoveFileContractID(tx, fcr.ParentID, txid)
@@ -182,6 +184,7 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 					dbRemoveFileContractRevision(tx, fcr.ParentID)
 				}
 				for _, sp := range txn.StorageProofs {
+					dbRemoveFileContractID(tx, sp.ParentID, txid)
 					dbRemoveStorageProof(tx, sp.ParentID)
 				}
 				for _, sfi := range txn.SiafundInputs {
@@ -198,13 +201,15 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 
 			// remove the associated block facts
 			dbRemoveBlockFacts(tx, bid)
+
+			e.log.Println("REVERTED END:", blockheight)
 		}
 
 		// Update cumulative stats for applied blocks.
-		for _, block := range cc.AppliedBlocks {
+		for i, block := range cc.AppliedBlocks {
 			bid := block.ID()
 			tbid := types.TransactionID(bid)
-
+			e.log.Printf("Blockapply for %s at height %d ", bid, blockheight)
 			// special handling for genesis block
 			if bid == types.GenesisID {
 				dbAddGenesisBlock(tx)
@@ -212,6 +217,7 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 			}
 
 			blockheight++
+
 			dbAddBlockID(tx, bid, blockheight)
 			dbAddTransactionID(tx, tbid, blockheight) // Miner payouts are a transaction
 
@@ -242,6 +248,7 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 					scoid := txn.SiacoinOutputID(uint64(j))
 					dbAddSiacoinOutputID(tx, scoid, txid)
 					dbAddUnlockHash(tx, sco.UnlockHash, txid)
+					dbAddSiacoinOutput(tx, scoid, sco)
 				}
 				for k, fc := range txn.FileContracts {
 					fcid := txn.FileContractID(uint64(k))
@@ -296,13 +303,64 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 			if err == nil {
 				dbAddBlockFacts(tx, facts)
 			} else {
-				e.log.Printf("Error calculating block facts: %s", err)
-				err = e.goBackInTime(tx, e.cs, blockheight)
-				if err != nil {
-					e.log.Printf("Error going back in time: %s", err)
+				e.log.Printf("Error calculating block facts: %s at height: %d", err, blockheight)
+				return err
+				// err = e.goBackInTime(tx, e.cs, blockheight)
+				// if err != nil {
+				// 	e.log.Printf("Error going back in time: %s", err)
+				// 	return err
+				// }
+			}
+			if i == len(cc.AppliedBlocks) {
+				// Compute the changes in the active set. Note, because this is calculated
+				// at the end instead of in a loop, the historic facts may contain
+				// inaccuracies about the active set. This should not be a problem except
+				// for large reorgs.
+				// TODO: improve this
+
+				// Moved this from the end of the loop to inside the loop
+				// This is because we want to check the final blockid to ensure
+				// it's equal to the one in the consensus set.
+				currentBlock, exists := e.cs.BlockAtHeight(blockheight)
+
+				if !exists && build.DEBUG {
+					build.Critical("consensus is missing block", blockheight)
+				} else if !exists {
+					e.log.Printf("consensus is missing block: %d", blockheight)
+					return errors.New("Consensus is missing block")
+				}
+				currentID := currentBlock.ID()
+				if currentID != bid {
+					e.log.Printf("Consensus block data does not match current block. Likely a orphaned/reverted block.")
 					return err
 				}
+				var facts blockFacts
+				e.log.Println("Fetching block facts for ", currentID)
+
+				err = dbGetAndDecode(bucketBlockFacts, currentID, &facts)(tx)
+				if err == nil {
+					for _, diff := range cc.FileContractDiffs {
+						if diff.Direction == modules.DiffApply {
+							facts.ActiveContractCount++
+							facts.ActiveContractCost = facts.ActiveContractCost.Add(diff.FileContract.Payout)
+							facts.ActiveContractSize = facts.ActiveContractSize.Add(types.NewCurrency64(diff.FileContract.FileSize))
+						} else {
+							facts.ActiveContractCount--
+							facts.ActiveContractCost = facts.ActiveContractCost.Sub(diff.FileContract.Payout)
+							facts.ActiveContractSize = facts.ActiveContractSize.Sub(types.NewCurrency64(diff.FileContract.FileSize))
+						}
+					}
+					dbAddBlockFacts(tx, facts)
+				} else {
+					e.log.Printf("Error getting block facts for %s.  Height: %d", currentBlock.ID(), blockheight)
+					return err
+					// err = e.goBackInTime(tx, e.cs, blockheight)
+					// if err != nil {
+					// 	return err
+					// }
+				}
 			}
+			e.log.Println("APPLY End", blockheight)
 		}
 
 		// Update stats according to SiacoinOutputDiffs
@@ -319,59 +377,26 @@ func (e *Explorer) ProcessConsensusChange(cc modules.ConsensusChange) {
 			}
 		}
 
-		// Compute the changes in the active set. Note, because this is calculated
-		// at the end instead of in a loop, the historic facts may contain
-		// inaccuracies about the active set. This should not be a problem except
-		// for large reorgs.
-		// TODO: improve this
-		currentBlock, exists := e.cs.BlockAtHeight(blockheight)
-		if !exists && build.DEBUG {
-			build.Critical("consensus is missing block", blockheight)
-		} else if !exists {
-			e.log.Printf("consensus is missing block: %d", blockheight)
-			return
-		}
-		currentID := currentBlock.ID()
-		var facts blockFacts
-
-		err = dbGetAndDecode(bucketBlockFacts, currentID, &facts)(tx)
-		if err == nil {
-			for _, diff := range cc.FileContractDiffs {
-				if diff.Direction == modules.DiffApply {
-					facts.ActiveContractCount++
-					facts.ActiveContractCost = facts.ActiveContractCost.Add(diff.FileContract.Payout)
-					facts.ActiveContractSize = facts.ActiveContractSize.Add(types.NewCurrency64(diff.FileContract.FileSize))
-				} else {
-					facts.ActiveContractCount--
-					facts.ActiveContractCost = facts.ActiveContractCost.Sub(diff.FileContract.Payout)
-					facts.ActiveContractSize = facts.ActiveContractSize.Sub(types.NewCurrency64(diff.FileContract.FileSize))
-				}
-			}
-			dbAddBlockFacts(tx, facts)
-		} else {
-			e.log.Printf("Error getting block facts for %s.  Height: %d", currentBlock.ID(), blockheight)
-			err = e.goBackInTime(tx, e.cs, blockheight)
-			if err != nil {
-				return err
-			}
-		}
-
 		e.log.Printf("Explorer update for block: %d", blockheight)
+
 		e.persistMu.Lock()
 		e.persist.Height = blockheight
 		e.persist.RecentChange = cc.ID
 		e.persist.Target = cc.ChildTarget
+		err = e.saveSync()
 		e.persistMu.Unlock()
 
-		err = e.saveSync()
 		return err
 	})
-
-	if err != nil && build.DEBUG {
-		build.Critical("explorer update failed:", err)
-	} else if err != nil {
-		e.log.Printf("explorer update failed: %s", err)
+	if err != nil {
+		build.Critical("Explorer failed:", err)
 	}
+
+	// if err != nil && build.DEBUG {
+	// 	build.Critical("explorer update failed:", err)
+	// } else if err != nil {
+	// 	e.log.Printf("explorer update failed: %s", err)
+	// }
 }
 
 func (e *Explorer) goBackInTime(tx *bolt.Tx, cs modules.ConsensusSet, height types.BlockHeight) error {

@@ -1,12 +1,13 @@
 package explorer
 
 import (
+	"os"
+	"path/filepath"
+
 	"github.com/NebulousLabs/Sia/modules"
 	"github.com/NebulousLabs/Sia/persist"
 	"github.com/NebulousLabs/Sia/types"
 	"github.com/NebulousLabs/bolt"
-	"os"
-	"path/filepath"
 )
 
 const (
@@ -56,7 +57,8 @@ func (e *Explorer) initPersist() error {
 			bucketHashType,
 		}
 		for _, b := range buckets {
-			_, err := tx.CreateBucketIfNotExists(b)
+			bucket, err := tx.CreateBucketIfNotExists(b)
+			bucket.FillPercent = 1
 			if err != nil {
 				return err
 			}
